@@ -1,0 +1,179 @@
+{
+  "name": "Health Automation - HL7/FHIR LLM with Guardrail & MCP",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "health-llm-guardrail",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Webhook - Receive HL7/FHIR",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const hl7 = require('hl7'); // optional if available; manual parsing fallback\n\n// Input data\nconst inputData = $input.first().json.body;\nlet parsed = { type: null, data: null, raw: inputData };\n\n// Detect HL7 (pipe-separated, typical MSH segment)\nif (typeof inputData === 'string' && (inputData.startsWith('MSH') || inputData.includes('\\nMSH'))) {\n  // Simple HL7 to JSON\n  const segments = inputData.split(/\\r?\\n/);\n  const hl7Json = { segments: [] };\n  for (const seg of segments) {\n    const fields = seg.split('|');\n    hl7Json.segments.push({ name: fields[0], fields: fields.slice(1) });\n  }\n  parsed.type = 'HL7';\n  parsed.data = hl7Json;\n  parsed.patientId = hl7Json.segments.find(s => s.name === 'PID')?.fields[2] || 'unknown';\n} else if (typeof inputData === 'object' && (inputData.resourceType || inputData.entry)) {\n  // FHIR resource or bundle\n  parsed.type = 'FHIR';\n  parsed.data = inputData;\n  parsed.patientId = inputData.id || (inputData.subject?.reference) || 'unknown';\n} else {\n  throw new Error('Unsupported format. Please send HL7 string or FHIR JSON.');\n}\n\n// Extract condition/problem for LLM context\nlet clinicalContext = '';\nif (parsed.type === 'HL7') {\n  const obxSegments = parsed.data.segments.filter(s => s.name === 'OBX');\n  clinicalContext = obxSegments.map(s => s.fields[4] || '').join(', ');\n} else if (parsed.type === 'FHIR') {\n  if (parsed.data.resourceType === 'Condition') {\n    clinicalContext = parsed.data.code?.text || parsed.data.code?.coding?.[0]?.display || '';\n  } else if (parsed.data.entry) {\n    const conditionEntry = parsed.data.entry.find(e => e.resource?.resourceType === 'Condition');\n    clinicalContext = conditionEntry?.resource?.code?.text || '';\n  }\n}\n\nreturn {\n  parsed,\n  clinicalContext: clinicalContext || 'No specific condition found.',\n  patientId: parsed.patientId\n};"
+      },
+      "id": "detect-parse",
+      "name": "Detect & Parse HL7/FHIR",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://your-mcp-server.example.com/context",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "patientId",
+              "value": "={{ $json.patientId }}"
+            },
+            {
+              "name": "clinicalContext",
+              "value": "={{ $json.clinicalContext }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "mcp",
+      "name": "MCP - Model Context Protocol",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [650, 300],
+      "notesInFlow": true,
+      "notes": "Replace with your actual MCP server endpoint. The server should return relevant clinical guidelines or safety context based on patientId and condition."
+    },
+    {
+      "parameters": {
+        "model": "gpt-4",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a clinical decision support assistant with strict guardrails.\n\nGUARDRAILS (MUST FOLLOW):\n1. NEVER provide definitive diagnoses or treatment plans.\n2. ALWAYS recommend consultation with a licensed physician.\n3. DO NOT predict outcomes or guarantee results.\n4. REFUSE to answer if the input is outside evidence-based guidelines.\n5. If uncertain, respond: 'I cannot provide an answer without verified clinical review.'\n\nYour role is to summarize, flag potential risks, and suggest general educational information only."
+            },
+            {
+              "role": "user",
+              "content": "=== PATIENT CLINICAL DATA ===\nHL7/FHIR Extract: {{ $json.clinicalContext }}\nPatient ID: {{ $json.patientId }}\n\n=== MCP CONTEXT (Clinical Guidelines & Safety) ===\n{{ $json.mcpResponse }}\n\nBased on the above, answer the following question (if any was provided in the original request) OR generate a brief risk assessment and educational summary. Ensure your response complies with the guardrails."
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 1000
+        }
+      },
+      "id": "llm",
+      "name": "LLM with Guardrail Prompt",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": "YOUR_OPENAI_CREDENTIALS"
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const llmOutput = $input.first().json.message.content;\n\n// Guardrail violation patterns\nconst forbiddenPatterns = [\n  /guarantee/i,\n  /100% cure/i,\n  /will definitely/i,\n  /always safe/i,\n  /no side effects/i,\n  /diagnose you with/i,\n  /prescribe/i,\n  /take this medication/i\n];\n\nlet isSafe = true;\nlet violations = [];\nfor (const pattern of forbiddenPatterns) {\n  if (pattern.test(llmOutput)) {\n    isSafe = false;\n    violations.push(pattern.source);\n  }\n}\n\nlet finalOutput = llmOutput;\nif (!isSafe) {\n  finalOutput = \"[GUARDRAIL ACTIVATED] The generated response contained potentially unsafe content. Please consult a licensed healthcare provider directly.\\n\\nOriginal violations: \" + violations.join(\", \");\n}\n\nreturn {\n  originalLlmResponse: llmOutput,\n  guardrailPassed: isSafe,\n  finalResponse: finalOutput,\n  violationsDetected: violations\n};"
+      },
+      "id": "guardrail-output",
+      "name": "Output Guardrail Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "response",
+      "name": "Send Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1250, 300]
+    }
+  ],
+  "connections": {
+    "Webhook - Receive HL7/FHIR": {
+      "main": [
+        [
+          {
+            "node": "Detect & Parse HL7/FHIR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect & Parse HL7/FHIR": {
+      "main": [
+        [
+          {
+            "node": "MCP - Model Context Protocol",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MCP - Model Context Protocol": {
+      "main": [
+        [
+          {
+            "node": "LLM with Guardrail Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM with Guardrail Prompt": {
+      "main": [
+        [
+          {
+            "node": "Output Guardrail Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Output Guardrail Check": {
+      "main": [
+        [
+          {
+            "node": "Send Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": ["healthcare", "llm", "guardrail", "hl7", "fhir", "mcp"],
+  "triggerCount": 0,
+  "updatedAt": "2025-01-23T12:00:00.000Z",
+  "versionId": "1.0.0"
+}
